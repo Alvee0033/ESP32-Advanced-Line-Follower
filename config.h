@@ -147,6 +147,17 @@
 #define LOST_LINE_TIMEOUT 1000  // Time in ms before considering line lost
 #define STOP_ON_LOST      false // Stop motors when line is lost
 
+// PID Robustness Enhancements
+#define LINE_LOSS_SEARCH_START    200   // ms before starting search pattern
+#define LINE_LOSS_SEARCH_WIDE     500   // ms before wide search pattern
+#define SHARP_CURVE_THRESHOLD     8.0   // Error threshold for curve detection
+#define STRAIGHT_THRESHOLD        2.0   // Error threshold for straight detection
+#define SPEED_CURVE_FACTOR        0.75  // Speed multiplier on curves (75%)
+#define SPEED_STRAIGHT_FACTOR     1.15  // Speed multiplier on straights (115%)
+#define DERIVATIVE_SPIKE_FILTER   5.0   // Derivative spike threshold
+#define LINE_EDGE_BOOST          1.3    // PID boost at line edges
+#define SEARCH_OSCILLATE_SPEED   80     // Speed during search pattern
+
 // ============================================================================
 // TURN DETECTION SETTINGS
 // ============================================================================
@@ -187,6 +198,13 @@ enum JunctionAction {
 
 // Path Planning Configuration
 #define MAX_JUNCTIONS        10   // Maximum junctions in path plan
+
+// Path Planning Robustness
+#define JUNCTION_CONFIDENCE_MIN   0.70  // Minimum confidence to execute (70%)
+#define MAX_JUNCTION_INTERVAL     5000  // ms max time between junctions
+#define MISSED_JUNCTION_RECOVERY  true  // Enable missed junction recovery
+#define PATH_VALIDATION          true   // Validate path on startup
+#define CONFIDENCE_SENSOR_WEIGHT  0.1   // Weight per active sensor for confidence
 
 // Turn Movement Calibration
 #define FORWARD_BEFORE_TURN  50   // mm to move forward before turn

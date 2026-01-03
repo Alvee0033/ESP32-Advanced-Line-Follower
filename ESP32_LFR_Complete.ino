@@ -84,6 +84,23 @@ long rightTargetPulses = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastLineDetected = 0;
 
+// Line Following Robustness
+unsigned long lineAge = 0;
+bool lineSearchActive = false;
+int searchDirection = 1;
+float lastValidError = 0;
+float lastDerivative = 0;
+
+// Path Planning Robustness
+struct PathExecutionState {
+  int junctionsExecuted;
+  int junctionsMissed;
+  unsigned long lastJunctionTime;
+  float avgConfidence;
+};
+PathExecutionState pathState = {0, 0, 0, 0.0};
+float junctionConfidence = 0.0;
+
 // ============================================================================
 // SETTINGS STRUCTURE & MENU SYSTEM
 // ============================================================================
@@ -383,10 +400,50 @@ void setup() {
   // Calibrate sensors
   calibrateSensors();
   
+  // Validate path plan
+  validatePathPlan();
+  
+  // Initialize path execution state
+  pathState.junctionsExecuted = 0;
+  pathState.junctionsMissed = 0;
+  pathState.lastJunctionTime = 0;
+  pathState.avgConfidence = 0.0;
+  
   // Start in line following mode
   currentMode = MODE_LINE_FOLLOW;
   
   Serial.println("Setup complete!");
+}
+
+// ============================================================================
+// PATH PLANNING VALIDATION
+// ============================================================================
+
+bool validatePathPlan() {
+  #if !PATH_VALIDATION
+    return true;
+  #endif
+  
+  if (settings.numJunctions == 0) {
+    Serial.println("Path Plan: Empty (no junctions programmed)");
+    return false;
+  }
+  
+  if (settings.numJunctions > MAX_JUNCTIONS) {
+    Serial.print("Path Plan: ERROR - numJunctions (");
+    Serial.print(settings.numJunctions);
+    Serial.print(") exceeds MAX_JUNCTIONS (");
+    Serial.print(MAX_JUNCTIONS);
+    Serial.println(")");
+    settings.numJunctions = MAX_JUNCTIONS;
+    return false;
+  }
+  
+  Serial.print("Path Plan: Valid - ");
+  Serial.print(settings.numJunctions);
+  Serial.println(" junctions programmed");
+  
+  return true;
 }
 
 // ============================================================================
@@ -630,16 +687,42 @@ void followLine() {
   if (activeCount > 0) {
     error = weightedSum / (float)activeCount;
     lastLineDetected = millis();
+    lastValidError = error;
+    lineAge = 0;
+    lineSearchActive = false;
   } else {
-    // Line lost - use last error direction
-    if (millis() - lastLineDetected > LOST_LINE_TIMEOUT) {
+    // Line lost - graduated recovery strategy
+    lineAge = millis() - lastLineDetected;
+    
+    if (lineAge < LINE_LOSS_SEARCH_START) {
+      // Phase 1: Continue with last error (0-200ms)
+      error = lastValidError;
+    } else if (lineAge < LINE_LOSS_SEARCH_WIDE) {
+      // Phase 2: Small oscillating search (200-500ms)
+      if (!lineSearchActive) {
+        lineSearchActive = true;
+        searchDirection = (lastValidError > 0) ? 1 : -1;
+      }
+      error = lastValidError + (searchDirection * 3.0 * sin(millis() / 100.0));
+    } else if (lineAge < LINE_LOSS_TIMEOUT) {
+      // Phase 3: Wide sweep search (500-1000ms)
+      error = lastValidError + (searchDirection * 8.0 * sin(millis() / 150.0));
+    } else {
+      // Phase 4: Stop if configured (>1000ms)
       if (STOP_ON_LOST) {
         stopMotors();
         return;
       }
+      error = lastValidError;  // Keep trying last known direction
     }
-    // Keep last error to continue in the same direction
   }
+  
+  // Detect line edges for aggressive correction
+  bool atLeftEdge = (sensorBinary[0] || sensorBinary[1]) && 
+                    !(sensorBinary[10] || sensorBinary[11]);
+  bool atRightEdge = (sensorBinary[10] || sensorBinary[11]) && 
+                     !(sensorBinary[0] || sensorBinary[1]);
+  float edgeBoost = (atLeftEdge || atRightEdge) ? LINE_EDGE_BOOST : 1.0;
   
   // Adaptive PID gains based on error magnitude
   float currentKp = settings.kp;
@@ -652,18 +735,42 @@ void followLine() {
     }
   #endif
   
-  // Integral calculation with anti-windup
+  // Apply edge boost to gains
+  currentKp *= edgeBoost;
+  currentKd *= edgeBoost;
+  
+  // Integral calculation with enhanced anti-windup
   // Only integrate when error is reasonable (not lost)
   if (activeCount > 0 && abs(error) < 10) {
     integral += error;
-    integral = constrain(integral, -INTEGRAL_MAX, INTEGRAL_MAX);
+    // Different limits for curves vs straights
+    float integralLimit = (abs(error) > SHARP_CURVE_THRESHOLD) ? 
+                         INTEGRAL_MAX * 0.5 : INTEGRAL_MAX;
+    integral = constrain(integral, -integralLimit, integralLimit);
   } else {
-    // Reset integral when line is lost or error too large
-    integral = integral * 0.8;  // Decay instead of hard reset
+    // Faster decay when line lost or error large
+    integral = integral * 0.7;
   }
   
-  // Derivative calculation with low-pass filter
+  // Detect error direction change (crossed line center)
+  if ((error > 0 && lastError < 0) || (error < 0 && lastError > 0)) {
+    if (abs(error - lastError) > 8.0) {
+      // Significant crossover - reset integral
+      integral = 0;
+    }
+  }
+  
+  // Derivative calculation with spike filtering
   derivative = error - lastError;
+  
+  // Filter derivative spikes (likely sensor noise)
+  if (abs(derivative - lastDerivative) > DERIVATIVE_SPIKE_FILTER) {
+    // Smooth out the spike
+    derivative = lastDerivative * 0.7 + derivative * 0.3;
+  }
+  lastDerivative = derivative;
+  
+  // Apply low-pass filter to derivative
   filteredDerivative = (DERIVATIVE_FILTER * filteredDerivative) + 
                        ((1.0 - DERIVATIVE_FILTER) * derivative);
   
@@ -673,9 +780,24 @@ void followLine() {
               (currentKd * filteredDerivative);
   pidOutput = constrain(pidOutput, PID_MIN, PID_MAX);
   
-  // Calculate motor speeds with smooth control - use settings.baseSpeed
-  leftSpeed = constrain(settings.baseSpeed - pidOutput, MIN_SPEED, MAX_SPEED);
-  rightSpeed = constrain(settings.baseSpeed + pidOutput, MIN_SPEED, MAX_SPEED);
+  // Adaptive speed control based on error (curve/straight detection)
+  float adaptiveSpeed = settings.baseSpeed;
+  if (activeCount > 0) {  // Only adjust speed when line detected
+    if (abs(error) > SHARP_CURVE_THRESHOLD) {
+      // Sharp curve detected - slow down
+      adaptiveSpeed *= SPEED_CURVE_FACTOR;
+    } else if (abs(error) < STRAIGHT_THRESHOLD && abs(derivative) < 1.0) {
+      // Straight section - speed up
+      adaptiveSpeed *= SPEED_STRAIGHT_FACTOR;
+    }
+  } else if (lineSearchActive) {
+    // Slow speed during search
+    adaptiveSpeed = SEARCH_OSCILLATE_SPEED;
+  }
+  
+  // Calculate motor speeds with adaptive base speed
+  leftSpeed = constrain(adaptiveSpeed - pidOutput, MIN_SPEED, MAX_SPEED);
+  rightSpeed = constrain(adaptiveSpeed + pidOutput, MIN_SPEED, MAX_SPEED);
   
   setMotorSpeeds(leftSpeed, rightSpeed);
   
@@ -686,6 +808,8 @@ void followLine() {
     Serial.print(" | I: "); Serial.print(integral);
     Serial.print(" | D: "); Serial.print(filteredDerivative);
     Serial.print(" | PID: "); Serial.print(pidOutput);
+    Serial.print(" | Speed: "); Serial.print(adaptiveSpeed, 0);
+    if (lineSearchActive) Serial.print(" [SEARCH]");
     Serial.print(" | L: "); Serial.print(leftSpeed);
     Serial.print(" | R: "); Serial.println(rightSpeed);
   }
@@ -697,6 +821,7 @@ void followLine() {
 
 TurnType detectTurn() {
   #if !ENABLE_TURN_DETECTION
+    junctionConfidence = 0.0;
     return TURN_NONE;
   #endif
   
@@ -718,7 +843,8 @@ TurnType detectTurn() {
   for (int i = RIGHT_SENSOR_START; i <= RIGHT_SENSOR_END; i++) {
     if (sensorBinary[i]) {
       rightCount++;
-      totalCount++;
+      totalCount++
+;
     }
   }
   
@@ -730,41 +856,61 @@ TurnType detectTurn() {
     }
   }
   
-  // Detect turn patterns
+  // Initialize confidence
+  junctionConfidence = 0.0;
+  TurnType detectedTurn = TURN_NONE;
+  
+  // Detect turn patterns with confidence scoring
   // Crossroad: All regions active
   if (leftCount >= TURN_DETECT_THRESHOLD && 
       rightCount >= TURN_DETECT_THRESHOLD && 
       centerCount >= 2) {
-    return TURN_CROSSROAD;
+    detectedTurn = TURN_CROSSROAD;
+    // High confidence if all zones well-represented
+    junctionConfidence = 0.6 + (totalCount * CONFIDENCE_SENSOR_WEIGHT);
+    junctionConfidence = constrain(junctionConfidence, 0, 1.0);
   }
-  
   // T-Junction: Both left and right active
-  if (leftCount >= TURN_DETECT_THRESHOLD && 
+  else if (leftCount >= TURN_DETECT_THRESHOLD && 
       rightCount >= TURN_DETECT_THRESHOLD) {
-    return TURN_T_JUNCTION;
+    detectedTurn = TURN_T_JUNCTION;
+    // Confidence based on left+right balance
+    float balance = 1.0 - abs(leftCount - rightCount) / 3.0;
+    junctionConfidence = constrain(0.6 + balance * 0.3, 0, 1.0);
   }
-  
   // 90° Left turn: Left sensors heavily active, right sensors minimal
-  if (leftCount >= TURN_DETECT_THRESHOLD && rightCount < 2) {
-    return TURN_LEFT;
+  else if (leftCount >= TURN_DETECT_THRESHOLD && rightCount < 2) {
+    detectedTurn = TURN_LEFT;
+    junctionConfidence = 0.5 + (leftCount * CONFIDENCE_SENSOR_WEIGHT);
+    junctionConfidence = constrain(junctionConfidence, 0, 1.0);
   }
-  
   // 90° Right turn: Right sensors heavily active, left sensors minimal
-  if (rightCount >= TURN_DETECT_THRESHOLD && leftCount < 2) {
-    return TURN_RIGHT;
+  else if (rightCount >= TURN_DETECT_THRESHOLD && leftCount < 2) {
+    detectedTurn = TURN_RIGHT;
+    junctionConfidence = 0.5 + (rightCount * CONFIDENCE_SENSOR_WEIGHT);
+    junctionConfidence = constrain(junctionConfidence, 0, 1.0);
   }
-  
   // Sharp left turn: Only leftmost sensors
-  if (leftCount >= 2 && totalCount < 5 && rightCount == 0) {
-    return TURN_SHARP_LEFT;
+  else if (leftCount >= 2 && totalCount < 5 && rightCount == 0) {
+    detectedTurn = TURN_SHARP_LEFT;
+    junctionConfidence = 0.6 + (leftCount * CONFIDENCE_SENSOR_WEIGHT);
   }
-  
   // Sharp right turn: Only rightmost sensors
-  if (rightCount >= 2 && totalCount < 5 && leftCount == 0) {
-    return TURN_SHARP_RIGHT;
+  else if (rightCount >= 2 && totalCount < 5 && leftCount == 0) {
+    detectedTurn = TURN_SHARP_RIGHT;
+    junctionConfidence = 0.6 + (rightCount * CONFIDENCE_SENSOR_WEIGHT);
   }
   
-  return TURN_NONE;
+  #if DEBUG_SENSORS
+    if (detectedTurn != TURN_NONE) {
+      Serial.print("Turn detected: ");
+      Serial.print(detectedTurn);
+      Serial.print(" Confidence: ");
+      Serial.println(junctionConfidence, 2);
+    }
+  #endif
+  
+  return detectedTurn;
 }
 
 void executeTurn(TurnType turnType) {
@@ -774,6 +920,34 @@ void executeTurn(TurnType turnType) {
   
   // Check if this is a junction (T or crossroad)
   if (turnType == TURN_T_JUNCTION || turnType == TURN_CROSSROAD) {
+    // Confidence check for junctions
+    #if PATH_VALIDATION
+      if (junctionConfidence < JUNCTION_CONFIDENCE_MIN) {
+        #if DEBUG_SENSORS
+          Serial.print("Junction rejected - low confidence: ");
+          Serial.println(junctionConfidence, 2);
+        #endif
+        turnInProgress = false;
+        return;
+      }
+    #endif
+    
+    // Check for missed junctions
+    #if MISSED_JUNCTION_RECOVERY
+      unsigned long timeSinceLastJunction = millis() - pathState.lastJunctionTime;
+      if (pathState.lastJunctionTime > 0 && 
+          timeSinceLastJunction > MAX_JUNCTION_INTERVAL &&
+          currentJunction < settings.numJunctions) {
+        // Junction likely missed - auto skip
+        #if DEBUG_SENSORS
+          Serial.print("Missed junction detected. Skipping junction ");
+          Serial.println(currentJunction + 1);
+        #endif
+        pathState.junctionsMissed++;
+        currentJunction++;
+      }
+    #endif
+    
     if (pathPlanEnabled && currentJunction < settings.numJunctions) {
       // Validate array bounds
       if (currentJunction >= MAX_JUNCTIONS) {
@@ -808,11 +982,19 @@ void executeTurn(TurnType turnType) {
           Serial.println("STRAIGHT");
         #endif
         turnInProgress = false;
-        currentJunction++;  // Still increment counter
+        currentJunction++;
+        // Update path state
+        pathState.junctionsExecuted++;
+        pathState.lastJunctionTime = millis();
+        pathState.avgConfidence = (pathState.avgConfidence + junctionConfidence) / 2.0;
         return;
       }
       
       currentJunction++;  // Move to next junction
+      // Update path state
+      pathState.junctionsExecuted++;
+      pathState.lastJunctionTime = millis();
+      pathState.avgConfidence = (pathState.avgConfidence + junctionConfidence) / 2.0;
     } else {
       // No plan or past end of plan: go straight by default
       #if DEBUG_SENSORS

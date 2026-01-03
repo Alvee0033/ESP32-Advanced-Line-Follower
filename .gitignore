@@ -1,0 +1,52 @@
+# Compiled Object files
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Arduino build files
+*.elf
+*.hex
+*.bin
+*.eep
+*.lss
+*.map
+*.sym
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Backup files
+*~
+*.bak
+*.swp

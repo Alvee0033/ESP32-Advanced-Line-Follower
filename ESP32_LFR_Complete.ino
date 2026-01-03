@@ -215,24 +215,29 @@ void loadSettings() {
   uint8_t storedVersion = preferences.getUChar("version", 0);
   
   if (storedVersion == SETTINGS_VERSION) {
-    // Load saved settings
+    // Load saved settings with validation
     settings.version = storedVersion;
-    settings.baseSpeed = preferences.getFloat("baseSpeed", BASE_SPEED);
-    settings.kp = preferences.getFloat("kp", KP);
-    settings.kd = preferences.getFloat("kd", KD);
-    settings.pulsesPerDegree = preferences.getFloat("ppd", PULSES_PER_DEGREE);
-    settings.forwardBeforeTurn = preferences.getInt("fwdBefore", FORWARD_BEFORE_TURN);
-    settings.forwardAfterTurn = preferences.getInt("fwdAfter", FORWARD_AFTER_TURN);
     
-    // Load path plan
-    settings.numJunctions = preferences.getUChar("numJunc", 0);
+    // Validate and constrain PID parameters
+    settings.baseSpeed = constrain(preferences.getFloat("baseSpeed", BASE_SPEED), 50, 255);
+    settings.kp = constrain(preferences.getFloat("kp", KP), 0, 10);
+    settings.kd = constrain(preferences.getFloat("kd", KD), 0, 10);
+    settings.pulsesPerDegree = constrain(preferences.getFloat("ppd", PULSES_PER_DEGREE), 0.1, 50);
+    settings.forwardBeforeTurn = constrain(preferences.getInt("fwdBefore", FORWARD_BEFORE_TURN), 0, 500);
+    settings.forwardAfterTurn = constrain(preferences.getInt("fwdAfter", FORWARD_AFTER_TURN), 0, 500);
+    
+    // Load and validate path plan
+    settings.numJunctions = constrain(preferences.getUChar("numJunc", 0), 0, MAX_JUNCTIONS);
     for (int i = 0; i < MAX_JUNCTIONS; i++) {
       char key[16];
       sprintf(key, "junc%d", i);
-      settings.pathPlan[i] = (JunctionAction)preferences.getUChar(key, JUNCTION_STRAIGHT);
+      uint8_t action = preferences.getUChar(key, JUNCTION_STRAIGHT);
+      // Validate action is within enum range
+      if (action > JUNCTION_RIGHT) action = JUNCTION_STRAIGHT;
+      settings.pathPlan[i] = (JunctionAction)action;
     }
     
-    Serial.println("Settings loaded from EEPROM");
+    Serial.println("Settings loaded from EEPROM (validated)");
   } else {
     // Use defaults
     settings.version = SETTINGS_VERSION;
@@ -770,23 +775,38 @@ void executeTurn(TurnType turnType) {
   // Check if this is a junction (T or crossroad)
   if (turnType == TURN_T_JUNCTION || turnType == TURN_CROSSROAD) {
     if (pathPlanEnabled && currentJunction < settings.numJunctions) {
+      // Validate array bounds
+      if (currentJunction >= MAX_JUNCTIONS) {
+        Serial.println("ERROR: currentJunction >= MAX_JUNCTIONS");
+        turnInProgress = false;
+        return;
+      }
+      
       // Use programmed action from path plan
       JunctionAction plannedAction = settings.pathPlan[currentJunction];
       
-      Serial.print("Junction ");
-      Serial.print(currentJunction + 1);
-      Serial.print(" -> ");
+      #if DEBUG_SENSORS
+        Serial.print("Junction ");
+        Serial.print(currentJunction + 1);
+        Serial.print(" -> ");
+      #endif
       
       // Convert to turn type
       if (plannedAction == JUNCTION_LEFT) {
         turnType = TURN_LEFT;
-        Serial.println("LEFT");
+        #if DEBUG_SENSORS
+          Serial.println("LEFT");
+        #endif
       } else if (plannedAction == JUNCTION_RIGHT) {
         turnType = TURN_RIGHT;
-        Serial.println("RIGHT");
+        #if DEBUG_SENSORS
+          Serial.println("RIGHT");
+        #endif
       } else {
         // JUNCTION_STRAIGHT - don't turn
-        Serial.println("STRAIGHT");
+        #if DEBUG_SENSORS
+          Serial.println("STRAIGHT");
+        #endif
         turnInProgress = false;
         currentJunction++;  // Still increment counter
         return;
@@ -795,9 +815,11 @@ void executeTurn(TurnType turnType) {
       currentJunction++;  // Move to next junction
     } else {
       // No plan or past end of plan: go straight by default
-      if (currentJunction >= settings.numJunctions) {
-        Serial.println("Past plan end - going straight");
-      }
+      #if DEBUG_SENSORS
+        if (currentJunction >= settings.numJunctions) {
+          Serial.println("Past plan end - going straight");
+        }
+      #endif
       turnInProgress = false;
       return;
     }
@@ -1182,18 +1204,24 @@ void showPathPlanning() {
       display.println(actions[settings.pathPlan[i]]);
     }
     
-    // Bottom info
-    display.setCursor(0, 48);
+    // Bottom info and controls (adjusted Y positions to fit 64px screen)
+    display.setCursor(0, 42);
+    if (menuIndex == MAX_JUNCTIONS) display.print(F(">"));
+    else display.print(F(" "));
+    display.print(F("Curr: "));
+    display.println(currentJunction);
+    
+    display.setCursor(0, 50);
+    if (menuIndex == MAX_JUNCTIONS + 1) display.print(F(">"));
+    else display.print(F(" "));
     display.print(F("Total: "));
     display.println(settings.numJunctions);
     
-    display.setCursor(0, 56);
-    if (menuIndex == MAX_JUNCTIONS) {
-      display.println(F(">RESET  SAVE"));
-    } else if (menuIndex == MAX_JUNCTIONS + 1) {
-      display.println(F(" RESET >SAVE"));
+    display.setCursor(0, 58);
+    if (menuIndex == MAX_JUNCTIONS + 2) {
+      display.println(F(">SAVE"));
     } else {
-      display.println(F(" RESET  SAVE"));
+      display.println(F(" SAVE"));
     }
   }
   
@@ -1252,61 +1280,102 @@ void handleMenuNavigation() {
   // Submenu navigation
   else {
     if (currentMenu == MENU_PID_SETTINGS) {
-      if (upPressed) {
-        if (subMenuIndex > 0) subMenuIndex--;
-        else {
-          // Adjust values
-          if (subMenuIndex == 0) settings.baseSpeed = constrain(settings.baseSpeed + 5, 50, 255);
-          else if (subMenuIndex == 1) settings.kp = constrain(settings.kp + 0.1, 0, 5);
-          else if (subMenuIndex == 2) settings.kd = constrain(settings.kd + 0.1, 0, 3);
-        }
+      // Navigate between items
+      if (upPressed && subMenuIndex > 0) {
+        subMenuIndex--;
       }
-      if (downPressed) {
-        if (subMenuIndex < 3) {
-          // Adjust values
-          if (subMenuIndex == 0) settings.baseSpeed = constrain(settings.baseSpeed - 5, 50, 255);
-          else if (subMenuIndex == 1) settings.kp = constrain(settings.kp - 0.1, 0, 5);
-          else if (subMenuIndex == 2) settings.kd = constrain(settings.kd - 0.1, 0, 3);
-        } else if (subMenuIndex < 3) {
-          subMenuIndex++;
-        }
+      if (downPressed && subMenuIndex < 3) {
+        subMenuIndex++;
       }
+      
       if (selectPressed) {
         if (subMenuIndex == 3) {
+          // Save and exit
           saveSettings();
           inSubMenu = false;
           currentMenu = MENU_MAIN;
+          subMenuIndex = 0;
         } else {
-          subMenuIndex++;
+          // Enter edit mode (could add visual indicator here)
+          // For now, UP/DOWN will adjust values directly
         }
+      }
+      
+      // Handle long press for faster value adjustment
+      bool longPressUp = (btnUp.pressed == LOW && (millis() - btnUp.pressTime) > LONG_PRESS_TIME);
+      bool longPressDown = (btnDown.pressed == LOW && (millis() - btnDown.pressTime) > LONG_PRESS_TIME);
+      int increment = (longPressUp || longPressDown) ? 10 : 1;
+      
+      // Adjust values when holding button (not just on press)
+      if (btnUp.pressed == LOW && subMenuIndex < 3) {
+        if (subMenuIndex == 0) {
+          settings.baseSpeed = constrain(settings.baseSpeed + (increment * 5), 50, 255);
+        } else if (subMenuIndex == 1) {
+          settings.kp = constrain(settings.kp + 0.1, 0, 10);
+        } else if (subMenuIndex == 2) {
+          settings.kd = constrain(settings.kd + 0.1, 0, 10);
+        }
+        delay(100);  // Delay for smooth adjustment
+      }
+      
+      if (btnDown.pressed == LOW && subMenuIndex < 3) {
+        if (subMenuIndex == 0) {
+          settings.baseSpeed = constrain(settings.baseSpeed - (increment * 5), 50, 255);
+        } else if (subMenuIndex == 1) {
+          settings.kp = constrain(settings.kp - 0.1, 0, 10);
+        } else if (subMenuIndex == 2) {
+          settings.kd = constrain(settings.kd - 0.1, 0, 10);
+        }
+        delay(100);  // Delay for smooth adjustment
       }
     }
     else if (currentMenu == MENU_TURN_CALIBRATION) {
-      if (upPressed) {
-        if (subMenuIndex > 0) subMenuIndex--;
-        else {
-          if (subMenuIndex == 0) settings.pulsesPerDegree += 1.0;
-          else if (subMenuIndex == 1) settings.forwardBeforeTurn = constrain(settings.forwardBeforeTurn + 5, 0, 200);
-          else if (subMenuIndex == 2) settings.forwardAfterTurn = constrain(settings.forwardAfterTurn + 5, 0, 200);
-        }
+      // Navigate between items
+      if (upPressed && subMenuIndex > 0) {
+        subMenuIndex--;
       }
-      if (downPressed) {
-        if (subMenuIndex < 3) {
-          if (subMenuIndex == 0) settings.pulsesPerDegree = constrain(settings.pulsesPerDegree - 1.0, 1, 20);
-          else if (subMenuIndex == 1) settings.forwardBeforeTurn = constrain(settings.forwardBeforeTurn - 5, 0, 200);
-          else if (subMenuIndex == 2) settings.forwardAfterTurn = constrain(settings.forwardAfterTurn - 5, 0, 200);
-        } else if (subMenuIndex < 3) {
-          subMenuIndex++;
-        }
+      if (downPressed && subMenuIndex < 3) {
+        subMenuIndex++;
       }
+      
       if (selectPressed) {
         if (subMenuIndex == 3) {
+          // Save and exit
           saveSettings();
           inSubMenu = false;
           currentMenu = MENU_MAIN;
-        } else {
-          subMenuIndex++;
+          subMenuIndex = 0;
         }
+      }
+      
+      // Handle long press for faster value adjustment
+      bool longPressUp = (btnUp.pressed == LOW && (millis() - btnUp.pressTime) > LONG_PRESS_TIME);
+      bool longPressDown = (btnDown.pressed == LOW && (millis() - btnDown.pressTime) > LONG_PRESS_TIME);
+      int increment = (longPressUp || longPressDown) ? 5 : 1;
+      
+      // Adjust values when holding button
+      if (btnUp.pressed == LOW && subMenuIndex < 3) {
+        if (subMenuIndex == 0) {
+          settings.pulsesPerDegree += 0.1 * increment;
+          settings.pulsesPerDegree = constrain(settings.pulsesPerDegree, 0.1, 50);
+        } else if (subMenuIndex == 1) {
+          settings.forwardBeforeTurn = constrain(settings.forwardBeforeTurn + (5 * increment), 0, 500);
+        } else if (subMenuIndex == 2) {
+          settings.forwardAfterTurn = constrain(settings.forwardAfterTurn + (5 * increment), 0, 500);
+        }
+        delay(100);
+      }
+      
+      if (btnDown.pressed == LOW && subMenuIndex < 3) {
+        if (subMenuIndex == 0) {
+          settings.pulsesPerDegree -= 0.1 * increment;
+          settings.pulsesPerDegree = constrain(settings.pulsesPerDegree, 0.1, 50);
+        } else if (subMenuIndex == 1) {
+          settings.forwardBeforeTurn = constrain(settings.forwardBeforeTurn - (5 * increment), 0, 500);
+        } else if (subMenuIndex == 2) {
+          settings.forwardAfterTurn = constrain(settings.forwardAfterTurn - (5 * increment), 0, 500);
+        }
+        delay(100);
       }
     }
     else if (currentMenu == MENU_JUNCTION_PLANNING) {
@@ -1329,31 +1398,49 @@ void handleMenuNavigation() {
           editingJunction = -1;
         }
       } else {
-        // Junction list navigation
-        if (upPressed && menuIndex > 0) menuIndex--;
-        if (downPressed && menuIndex < MAX_JUNCTIONS + 1) menuIndex++;
-        
-        if (selectPressed) {
-          if (menuIndex < MAX_JUNCTIONS) {
-            // Edit junction
-            editingJunction = menuIndex;
-            subMenuIndex = settings.pathPlan[menuIndex];  // Current action
-            inSubMenu = true;
-          } else if (menuIndex == MAX_JUNCTIONS) {
-            // Reset counter
-            currentJunction = 0;
-            display.clearDisplay();
-            display.setCursor(20, 28);
-            display.setTextSize(1);
-            display.println("COUNTER RESET!");
-            display.display();
-            delay(1000);
-          } else if (menuIndex == MAX_JUNCTIONS + 1) {
-            // Save and exit
-            saveSettings();
-            inSubMenu = false;
-            currentMenu = MENU_MAIN;
-            menuIndex = 0;
+        // Junction list navigation - special handling for Curr and Total
+        if (menuIndex == MAX_JUNCTIONS) {
+          // On "Curr:" - only adjust value, no navigation
+          if (upPressed && currentJunction < MAX_JUNCTIONS) {
+            currentJunction++;
+          } else if (downPressed && currentJunction > 0) {
+            currentJunction--;
+          }
+          
+          // SELECT to move to Total
+          if (selectPressed) {
+            menuIndex = MAX_JUNCTIONS + 1;
+          }
+        } else if (menuIndex == MAX_JUNCTIONS + 1) {
+          // On "Total:" - only adjust value, no navigation
+          if (upPressed && settings.numJunctions < MAX_JUNCTIONS) {
+            settings.numJunctions++;
+          } else if (downPressed && settings.numJunctions > 0) {
+            settings.numJunctions--;
+          }
+          
+          // SELECT to move to Save
+          if (selectPressed) {
+            menuIndex = MAX_JUNCTIONS + 2;
+          }
+        } else {
+          // Normal junction list navigation
+          if (upPressed && menuIndex > 0) menuIndex--;
+          if (downPressed && menuIndex < MAX_JUNCTIONS + 2) menuIndex++;
+          
+          if (selectPressed) {
+            if (menuIndex < MAX_JUNCTIONS) {
+              // Edit junction
+              editingJunction = menuIndex;
+              subMenuIndex = settings.pathPlan[menuIndex];  // Current action
+              inSubMenu = true;
+            } else if (menuIndex == MAX_JUNCTIONS + 2) {
+              // Save and exit
+              saveSettings();
+              inSubMenu = false;
+              currentMenu = MENU_MAIN;
+              menuIndex = 0;
+            }
           }
         }
       }

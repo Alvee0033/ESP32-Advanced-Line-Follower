@@ -90,7 +90,7 @@
 // ============================================================================
 #define BUTTON_UP         34    // Navigate up / Increase value
 #define BUTTON_DOWN       36    // Navigate down / Decrease value
-#define BUTTON_SELECT     37    // Enter menu / Confirm selection
+#define BUTTON_SELECT     39    // Enter menu / Confirm selection (FIXED: was 37, conflicted with SELECT_A)
 
 // Button Configuration
 #define BUTTON_DEBOUNCE   50    // Debounce delay in ms
